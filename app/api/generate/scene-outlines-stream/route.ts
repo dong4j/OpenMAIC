@@ -34,9 +34,12 @@ import type {
 import { apiError } from '@/lib/server/api-response';
 import { createLogger } from '@/lib/logger';
 import { resolveModelFromHeaders } from '@/lib/server/resolve-model';
+import { retrieveTextbookContext } from '@/lib/textbook/retrieve';
+import { logPromptPreview } from '@/lib/server/prompt-logging';
 const log = createLogger('Outlines Stream');
 
 export const maxDuration = 300;
+const OUTLINE_MAX_OUTPUT_TOKENS = 12000;
 
 /**
  * Extract the languageDirective from the streamed wrapper JSON.
@@ -149,6 +152,26 @@ export async function POST(req: NextRequest) {
     };
     requirementSnippet = requirements?.requirement?.substring(0, 60);
 
+    const textbookStartedAt = Date.now();
+    log.info(`Textbook retrieval starting for outline generation: "${requirements.requirement}"`);
+    const textbookResult = await retrieveTextbookContext(requirements.requirement, {
+      mode: 'outline',
+      maxChunks: 8,
+    });
+    log.info(
+      `Textbook retrieval completed in ${Date.now() - textbookStartedAt}ms: inScope=${textbookResult.inScope}, topUnit=${textbookResult.topUnit?.theme ?? 'none'}, topScore=${textbookResult.topScore}, coverage=${textbookResult.coverage.toFixed(2)}, contextChars=${textbookResult.context.length}, enhancedChanged=${textbookResult.enhancedRequirement !== requirements.requirement}`,
+    );
+    log.info(`Textbook retrieval summary: ${textbookResult.retrievalSummary}`);
+    log.info(`Enhanced requirement for outline:\n${textbookResult.enhancedRequirement}`);
+    log.info(`Textbook context for outline:\n${textbookResult.context}`);
+    if (!textbookResult.inScope) {
+      return apiError(
+        'INVALID_REQUEST',
+        400,
+        '该主题不在当前教材范围内，无法生成课件。请围绕教材中的敬业、诚信、踏实、沟通、协作、主动、坚持、学习、自控、创新等内容提问。',
+      );
+    }
+
     // Build user profile string for language inference context
     const userProfileText =
       requirements.userNickname || requirements.userBio
@@ -207,10 +230,11 @@ export async function POST(req: NextRequest) {
     const teacherContext = formatTeacherPersonaForPrompt(agents);
 
     const prompts = buildPrompt(PROMPT_IDS.REQUIREMENTS_TO_OUTLINES, {
-      requirement: requirements.requirement,
+      requirement: textbookResult.enhancedRequirement,
       pdfContent: pdfText ? pdfText.substring(0, MAX_PDF_CONTENT_CHARS) : 'None',
       availableImages: availableImagesText,
       researchContext: researchContext || 'None',
+      textbookContext: textbookResult.context,
       mediaGenerationPolicy,
       teacherContext,
       userProfile: userProfileText,
@@ -219,9 +243,10 @@ export async function POST(req: NextRequest) {
     if (!prompts) {
       return apiError('INTERNAL_ERROR', 500, 'Prompt template not found');
     }
+    logPromptPreview(log, 'Outline generation', prompts);
 
     log.info(
-      `Generating outlines: "${requirements.requirement.substring(0, 50)}" [model=${modelString}]`,
+      `Generating outlines: "${requirements.requirement.substring(0, 50)}" [model=${modelString}, maxOutputTokens=${Math.min(modelInfo?.outputWindow ?? OUTLINE_MAX_OUTPUT_TOKENS, OUTLINE_MAX_OUTPUT_TOKENS)}]`,
     );
 
     // Create SSE stream with heartbeat to prevent connection timeout
@@ -263,13 +288,19 @@ export async function POST(req: NextRequest) {
                     content: buildVisionUserContent(prompts.user, visionImages),
                   },
                 ],
-                maxOutputTokens: modelInfo?.outputWindow,
+                maxOutputTokens: Math.min(
+                  modelInfo?.outputWindow ?? OUTLINE_MAX_OUTPUT_TOKENS,
+                  OUTLINE_MAX_OUTPUT_TOKENS,
+                ),
               }
             : {
                 model: languageModel,
                 system: prompts.system,
                 prompt: prompts.user,
-                maxOutputTokens: modelInfo?.outputWindow,
+                maxOutputTokens: Math.min(
+                  modelInfo?.outputWindow ?? OUTLINE_MAX_OUTPUT_TOKENS,
+                  OUTLINE_MAX_OUTPUT_TOKENS,
+                ),
               };
 
           let parsedOutlines: SceneOutline[] = [];
@@ -278,6 +309,8 @@ export async function POST(req: NextRequest) {
 
           for (let attempt = 1; attempt <= MAX_STREAM_RETRIES + 1; attempt++) {
             try {
+              const attemptStartedAt = Date.now();
+              log.info(`Outline LLM stream starting (attempt ${attempt}/${MAX_STREAM_RETRIES + 1})`);
               const result = streamLLM(streamParams, 'scene-outlines-stream');
 
               let fullText = '';
@@ -318,6 +351,9 @@ export async function POST(req: NextRequest) {
                   controller.enqueue(encoder.encode(`data: ${event}\n\n`));
                 }
               }
+              log.info(
+                `Outline LLM stream finished in ${Date.now() - attemptStartedAt}ms (chars=${fullText.length}, parsedOutlines=${parsedOutlines.length})`,
+              );
 
               // Validate: got outlines?
               if (parsedOutlines.length > 0) break;

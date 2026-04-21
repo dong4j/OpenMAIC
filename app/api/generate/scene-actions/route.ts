@@ -26,12 +26,17 @@ import type { SpeechAction } from '@/lib/types/action';
 import { createLogger } from '@/lib/logger';
 import { apiError, apiSuccess } from '@/lib/server/api-response';
 import { resolveModelFromHeaders } from '@/lib/server/resolve-model';
+import { retrieveTextbookContext } from '@/lib/textbook/retrieve';
 
 const log = createLogger('Scene Actions API');
 
-export const maxDuration = 60;
+export const maxDuration = 300;
+
+const SCENE_ACTIONS_MAX_OUTPUT_TOKENS = 4096;
+const SCENE_ACTIONS_LLM_TIMEOUT_MS = 120_000;
 
 export async function POST(req: NextRequest) {
+  const requestStartedAt = Date.now();
   let outlineTitle: string | undefined;
   let resolvedModelString: string | undefined;
   try {
@@ -103,7 +108,11 @@ export async function POST(req: NextRequest) {
                 content: buildVisionUserContent(userPrompt, images),
               },
             ],
-            maxOutputTokens: modelInfo?.outputWindow,
+            maxOutputTokens: Math.min(
+              modelInfo?.outputWindow ?? SCENE_ACTIONS_MAX_OUTPUT_TOKENS,
+              SCENE_ACTIONS_MAX_OUTPUT_TOKENS,
+            ),
+            abortSignal: AbortSignal.timeout(SCENE_ACTIONS_LLM_TIMEOUT_MS),
           },
           'scene-actions',
         );
@@ -114,7 +123,11 @@ export async function POST(req: NextRequest) {
           model: languageModel,
           system: systemPrompt,
           prompt: userPrompt,
-          maxOutputTokens: modelInfo?.outputWindow,
+          maxOutputTokens: Math.min(
+            modelInfo?.outputWindow ?? SCENE_ACTIONS_MAX_OUTPUT_TOKENS,
+            SCENE_ACTIONS_MAX_OUTPUT_TOKENS,
+          ),
+          abortSignal: AbortSignal.timeout(SCENE_ACTIONS_LLM_TIMEOUT_MS),
         },
         'scene-actions',
       );
@@ -131,17 +144,40 @@ export async function POST(req: NextRequest) {
       previousSpeeches: incomingPreviousSpeeches ?? [],
     };
 
+    const textbookQuery = [outline.title, outline.description, ...(outline.keyPoints || [])].join(
+      '\n',
+    );
+    const textbookStartedAt = Date.now();
+    log.info(`Retrieving textbook context for actions: "${outline.title}"`);
+    const textbookResult = await retrieveTextbookContext(textbookQuery, {
+      mode: 'actions',
+      maxChunks: 3,
+      sourceChunkIds: outline.sourceChunkIds,
+    });
+    log.info(
+      `Textbook context ready for actions "${outline.title}" in ${Date.now() - textbookStartedAt}ms: inScope=${textbookResult.inScope}, chunks=${textbookResult.chunks.length}, contextChars=${textbookResult.context.length}, topUnit=${textbookResult.topUnit?.theme ?? 'none'}, topScore=${textbookResult.topScore}, coverage=${textbookResult.coverage.toFixed(2)}`,
+    );
+    log.info(`Textbook retrieval summary for actions: ${textbookResult.retrievalSummary}`);
+    log.info(`Textbook context for actions "${outline.title}":\n${textbookResult.context}`);
+
     // ── Generate actions ──
     log.info(`Generating actions: "${outline.title}" (${outline.type}) [model=${modelString}]`);
 
+    const actionsStartedAt = Date.now();
+    log.info(
+      `Calling scene action generator: "${outline.title}" (${ctx.pageIndex}/${ctx.totalPages}) previousSpeeches=${ctx.previousSpeeches.length}`,
+    );
     const actions = await generateSceneActions(outline, content, aiCall, {
       ctx,
       agents,
       userProfile,
       languageDirective,
+      textbookContext: textbookResult.context,
     });
 
-    log.info(`Generated ${actions.length} actions for: "${outline.title}"`);
+    log.info(
+      `Generated ${actions.length} actions for: "${outline.title}" in ${Date.now() - actionsStartedAt}ms`,
+    );
 
     // ── Build complete scene ──
     const scene = buildCompleteScene(outline, content, actions, stageId);
@@ -158,7 +194,7 @@ export async function POST(req: NextRequest) {
       .map((a) => a.text);
 
     log.info(
-      `Scene assembled successfully: "${outline.title}" — ${scene.actions?.length ?? 0} actions`,
+      `Scene assembled successfully: "${outline.title}" — ${scene.actions?.length ?? 0} actions, total=${Date.now() - requestStartedAt}ms`,
     );
 
     return apiSuccess({ scene, previousSpeeches: outputPreviousSpeeches });

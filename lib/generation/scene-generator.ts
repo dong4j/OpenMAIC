@@ -48,6 +48,11 @@ import type {
 import { createLogger } from '@/lib/logger';
 const log = createLogger('Generation');
 
+function previewForLog(text: string, limit = 4000): string {
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}\n... [truncated ${text.length - limit} chars]`;
+}
+
 // ── Options interfaces for scene generation functions ──
 
 export interface SceneContentOptions {
@@ -58,6 +63,7 @@ export interface SceneContentOptions {
   generatedMediaMapping?: ImageMapping;
   agents?: AgentInfo[];
   languageDirective?: string;
+  textbookContext?: string;
 }
 
 export interface SceneActionsOptions {
@@ -65,6 +71,7 @@ export interface SceneActionsOptions {
   agents?: AgentInfo[];
   userProfile?: string;
   languageDirective?: string;
+  textbookContext?: string;
 }
 
 // ==================== Stage 2: Full Scenes (Two-Step) ====================
@@ -187,6 +194,7 @@ export async function generateSceneContent(
     generatedMediaMapping,
     agents,
     languageDirective,
+    textbookContext,
   } = options;
   // If outline is interactive but missing interactiveConfig, fall back to slide
   if (outline.type === 'interactive' && !outline.interactiveConfig) {
@@ -203,6 +211,7 @@ export async function generateSceneContent(
       generatedMediaMapping,
       agents,
       languageDirective,
+      textbookContext,
     );
   }
 
@@ -217,6 +226,7 @@ export async function generateSceneContent(
         generatedMediaMapping,
         agents,
         languageDirective,
+        textbookContext,
       );
     case 'quiz':
       return generateQuizContent(outline, aiCall, languageDirective);
@@ -495,6 +505,7 @@ async function generateSlideContent(
   generatedMediaMapping?: ImageMapping,
   agents?: AgentInfo[],
   languageDirective?: string,
+  textbookContext?: string,
 ): Promise<GeneratedSlideContent | null> {
   // Build assigned images description for the prompt
   let assignedImagesText = 'No images available. Do NOT insert any image elements.';
@@ -566,6 +577,7 @@ async function generateSlideContent(
     keyPoints: (outline.keyPoints || []).map((p, i) => `${i + 1}. ${p}`).join('\n'),
     elements: '（根据要点自动生成）',
     assignedImages: assignedImagesText,
+    textbookContext: textbookContext || 'None',
     canvas_width: canvasWidth,
     canvas_height: canvasHeight,
     teacherContext,
@@ -576,7 +588,12 @@ async function generateSlideContent(
     return null;
   }
 
-  log.debug(`Generating slide content for: ${outline.title}`);
+  const llmStartedAt = Date.now();
+  log.info(
+    `Slide content LLM request starting: "${outline.title}" (systemChars=${prompts.system.length}, userChars=${prompts.user.length}, textbookChars=${textbookContext?.length ?? 0}, assignedImages=${assignedImages?.length ?? 0}, visionImages=${visionImages?.length ?? 0})`,
+  );
+  log.info(`Slide content system prompt preview for "${outline.title}":\n${previewForLog(prompts.system)}`);
+  log.info(`Slide content user prompt preview for "${outline.title}":\n${previewForLog(prompts.user)}`);
   if (assignedImages && assignedImages.length > 0) {
     log.debug(`Assigned images: ${assignedImages.map((img) => img.id).join(', ')}`);
   }
@@ -585,12 +602,18 @@ async function generateSlideContent(
   }
 
   const response = await aiCall(prompts.system, prompts.user, visionImages);
+  log.info(
+    `Slide content LLM response received: "${outline.title}" in ${Date.now() - llmStartedAt}ms (responseChars=${response.length})`,
+  );
   const generatedData = parseJsonResponse<GeneratedSlideData>(response);
 
   if (!generatedData || !generatedData.elements || !Array.isArray(generatedData.elements)) {
     log.error(`Failed to parse AI response for: ${outline.title}`);
     return null;
   }
+  log.info(
+    `Slide content parsed: "${outline.title}" (elements=${generatedData.elements.length}, hasBackground=${Boolean(generatedData.background)}, hasRemark=${Boolean(generatedData.remark)})`,
+  );
 
   log.debug(`Got ${generatedData.elements.length} elements for: ${outline.title}`);
 
@@ -945,7 +968,7 @@ export async function generateSceneActions(
   aiCall: AICallFn,
   options: SceneActionsOptions = {},
 ): Promise<Action[]> {
-  const { ctx, agents, userProfile, languageDirective } = options;
+  const { ctx, agents, userProfile, languageDirective, textbookContext } = options;
   const agentsText = formatAgentsForPrompt(agents);
 
   if (outline.type === 'slide' && 'elements' in content) {
@@ -960,6 +983,7 @@ export async function generateSceneActions(
       courseContext: buildCourseContext(ctx),
       agents: agentsText,
       userProfile: userProfile || '',
+      textbookContext: textbookContext || 'None',
       languageDirective: buildLanguageText(languageDirective, outline.languageNote),
     });
 
@@ -967,7 +991,16 @@ export async function generateSceneActions(
       return generateDefaultSlideActions(outline, content.elements);
     }
 
+    const llmStartedAt = Date.now();
+    log.info(
+      `Slide actions LLM request starting: "${outline.title}" (systemChars=${prompts.system.length}, userChars=${prompts.user.length}, textbookChars=${textbookContext?.length ?? 0}, elements=${content.elements.length})`,
+    );
+    log.info(`Slide actions system prompt preview for "${outline.title}":\n${previewForLog(prompts.system)}`);
+    log.info(`Slide actions user prompt preview for "${outline.title}":\n${previewForLog(prompts.user)}`);
     const response = await aiCall(prompts.system, prompts.user);
+    log.info(
+      `Slide actions LLM response received: "${outline.title}" in ${Date.now() - llmStartedAt}ms (responseChars=${response.length})`,
+    );
     const actions = parseActionsFromStructuredOutput(response, outline.type);
 
     if (actions.length > 0) {

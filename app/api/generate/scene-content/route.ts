@@ -18,12 +18,17 @@ import type { SceneOutline, PdfImage, ImageMapping } from '@/lib/types/generatio
 import { createLogger } from '@/lib/logger';
 import { apiError, apiSuccess } from '@/lib/server/api-response';
 import { resolveModelFromHeaders } from '@/lib/server/resolve-model';
+import { retrieveTextbookContext } from '@/lib/textbook/retrieve';
 
 const log = createLogger('Scene Content API');
 
 export const maxDuration = 300;
 
+const SCENE_CONTENT_MAX_OUTPUT_TOKENS = 8192;
+const SCENE_CONTENT_LLM_TIMEOUT_MS = 180_000;
+
 export async function POST(req: NextRequest) {
+  const requestStartedAt = Date.now();
   let outlineTitle: string | undefined;
   let resolvedModelString: string | undefined;
   try {
@@ -94,7 +99,11 @@ export async function POST(req: NextRequest) {
                 content: buildVisionUserContent(userPrompt, images),
               },
             ],
-            maxOutputTokens: modelInfo?.outputWindow,
+            maxOutputTokens: Math.min(
+              modelInfo?.outputWindow ?? SCENE_CONTENT_MAX_OUTPUT_TOKENS,
+              SCENE_CONTENT_MAX_OUTPUT_TOKENS,
+            ),
+            abortSignal: AbortSignal.timeout(SCENE_CONTENT_LLM_TIMEOUT_MS),
           },
           'scene-content',
         );
@@ -105,7 +114,11 @@ export async function POST(req: NextRequest) {
           model: languageModel,
           system: systemPrompt,
           prompt: userPrompt,
-          maxOutputTokens: modelInfo?.outputWindow,
+          maxOutputTokens: Math.min(
+            modelInfo?.outputWindow ?? SCENE_CONTENT_MAX_OUTPUT_TOKENS,
+            SCENE_CONTENT_MAX_OUTPUT_TOKENS,
+          ),
+          abortSignal: AbortSignal.timeout(SCENE_CONTENT_LLM_TIMEOUT_MS),
         },
         'scene-content',
       );
@@ -132,11 +145,37 @@ export async function POST(req: NextRequest) {
     // resolveImageIds() in generation-pipeline.ts will keep these placeholders in elements.
     const generatedMediaMapping: ImageMapping = {};
 
+    const textbookQuery = [
+      effectiveOutline.title,
+      effectiveOutline.description,
+      ...(effectiveOutline.keyPoints || []),
+    ].join('\n');
+    const textbookStartedAt = Date.now();
+    log.info(`Retrieving textbook context for content: "${effectiveOutline.title}"`);
+    const textbookResult = await retrieveTextbookContext(textbookQuery, {
+      mode: 'slide',
+      maxChunks: 3,
+      sourceChunkIds: effectiveOutline.sourceChunkIds,
+    });
+    log.info(
+      `Textbook context ready for "${effectiveOutline.title}" in ${Date.now() - textbookStartedAt}ms: inScope=${textbookResult.inScope}, chunks=${textbookResult.chunks.length}, contextChars=${textbookResult.context.length}, topUnit=${textbookResult.topUnit?.theme ?? 'none'}, topScore=${textbookResult.topScore}, coverage=${textbookResult.coverage.toFixed(2)}`,
+    );
+    log.info(`Textbook query for content "${effectiveOutline.title}":\n${textbookQuery}`);
+    log.info(`Textbook retrieval summary for content: ${textbookResult.retrievalSummary}`);
+    log.info(`Textbook context for content "${effectiveOutline.title}":\n${textbookResult.context}`);
+
     // ── Generate content ──
     log.info(
       `Generating content: "${effectiveOutline.title}" (${effectiveOutline.type}) [model=${modelString}]`,
     );
 
+    const generationStartedAt = Date.now();
+    log.info(
+      `Calling scene content generator: "${effectiveOutline.title}" (maxOutputTokens=${Math.min(
+        modelInfo?.outputWindow ?? SCENE_CONTENT_MAX_OUTPUT_TOKENS,
+        SCENE_CONTENT_MAX_OUTPUT_TOKENS,
+      )}, timeoutMs=${SCENE_CONTENT_LLM_TIMEOUT_MS})`,
+    );
     const content = await generateSceneContent(effectiveOutline, aiCall, {
       assignedImages,
       imageMapping,
@@ -145,7 +184,11 @@ export async function POST(req: NextRequest) {
       generatedMediaMapping,
       agents,
       languageDirective,
+      textbookContext: textbookResult.context,
     });
+    log.info(
+      `Scene content generator returned for "${effectiveOutline.title}" in ${Date.now() - generationStartedAt}ms`,
+    );
 
     if (!content) {
       log.error(`Failed to generate content for: "${effectiveOutline.title}"`);
@@ -157,7 +200,9 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    log.info(`Content generated successfully: "${effectiveOutline.title}"`);
+    log.info(
+      `Content generated successfully: "${effectiveOutline.title}" in ${Date.now() - requestStartedAt}ms`,
+    );
 
     return apiSuccess({ content, effectiveOutline });
   } catch (error) {

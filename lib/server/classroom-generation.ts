@@ -26,6 +26,7 @@ import {
   replaceMediaPlaceholders,
   generateTTSForClassroom,
 } from '@/lib/server/classroom-media-generation';
+import { retrieveTextbookContext } from '@/lib/textbook/retrieve';
 import type { UserRequirements } from '@/lib/types/generation';
 import type { Scene, Stage } from '@/lib/types/stage';
 import { AGENT_COLOR_PALETTE, AGENT_DEFAULT_AVATARS } from '@/lib/constants/agent-defaults';
@@ -224,6 +225,20 @@ export async function generateClassroom(
   };
   const pdfText = pdfContent?.text || undefined;
 
+  const textbookResult = await retrieveTextbookContext(requirement, {
+    mode: 'outline',
+    maxChunks: 8,
+  });
+  if (!textbookResult.inScope) {
+    throw new Error(
+      '该主题不在当前教材范围内，无法生成课件。请围绕教材中的敬业、诚信、踏实、沟通、协作、主动、坚持、学习、自控、创新等内容提问。',
+    );
+  }
+  log.info(
+    `Textbook retrieval for classroom: inScope=${textbookResult.inScope}, topUnit=${textbookResult.topUnit?.theme ?? 'none'}, topScore=${textbookResult.topScore}, coverage=${textbookResult.coverage.toFixed(2)}, contextChars=${textbookResult.context.length}`,
+  );
+  log.info(`Textbook retrieval summary for classroom: ${textbookResult.retrievalSummary}`);
+
   await options.onProgress?.({
     step: 'researching',
     progress: 10,
@@ -270,7 +285,7 @@ export async function generateClassroom(
   });
 
   const outlinesResult = await generateSceneOutlinesFromRequirements(
-    requirements,
+    { ...requirements, requirement: textbookResult.enhancedRequirement },
     pdfText,
     undefined,
     aiCall,
@@ -279,6 +294,7 @@ export async function generateClassroom(
       imageGenerationEnabled: input.enableImageGeneration,
       videoGenerationEnabled: input.enableVideoGeneration,
       researchContext,
+      textbookContext: textbookResult.context,
       // NO teacherContext — agents haven't been generated yet
     },
   );
@@ -362,15 +378,42 @@ export async function generateClassroom(
       totalScenes: outlines.length,
     });
 
-    const content = await generateSceneContent(safeOutline, aiCall, { agents, languageDirective });
+    const sceneTextbookResult = await retrieveTextbookContext(
+      [safeOutline.title, safeOutline.description, ...(safeOutline.keyPoints || [])].join('\n'),
+      {
+        mode: 'slide',
+        maxChunks: 3,
+        sourceChunkIds: safeOutline.sourceChunkIds,
+      },
+    );
+    log.info(
+      `Scene textbook context for "${safeOutline.title}": ${sceneTextbookResult.retrievalSummary}`,
+    );
+    const content = await generateSceneContent(safeOutline, aiCall, {
+      agents,
+      languageDirective,
+      textbookContext: sceneTextbookResult.context,
+    });
     if (!content) {
       log.warn(`Skipping scene "${safeOutline.title}" — content generation failed`);
       continue;
     }
 
+    const actionsTextbookResult = await retrieveTextbookContext(
+      [safeOutline.title, safeOutline.description, ...(safeOutline.keyPoints || [])].join('\n'),
+      {
+        mode: 'actions',
+        maxChunks: 3,
+        sourceChunkIds: safeOutline.sourceChunkIds,
+      },
+    );
+    log.info(
+      `Actions textbook context for "${safeOutline.title}": ${actionsTextbookResult.retrievalSummary}`,
+    );
     const actions = await generateSceneActions(safeOutline, content, aiCall, {
       agents,
       languageDirective,
+      textbookContext: actionsTextbookResult.context,
     });
     log.info(`Scene "${safeOutline.title}": ${actions.length} actions`);
 

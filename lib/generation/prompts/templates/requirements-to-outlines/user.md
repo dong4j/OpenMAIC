@@ -1,8 +1,8 @@
-Please generate scene outlines based on the following course requirements.
+Please generate scene outlines for a textbook-specific PPT/courseware generator.
 
 ---
 
-## User Requirements
+## User Requirements (possibly enhanced by textbook retrieval)
 
 {{requirement}}
 
@@ -20,6 +20,10 @@ Infer the course language directive by applying the decision rules from the syst
 ---
 
 ## Reference Materials
+
+### Built-in Textbook Context
+
+{{textbookContext}}
 
 ### PDF Content Summary
 
@@ -39,7 +43,9 @@ Infer the course language directive by applying the decision rules from the syst
 
 ## Output Requirements
 
-Please automatically infer the following from user requirements:
+You must first treat the built-in textbook context as the authoritative scope. The user's requirement may be very short, such as "沟通 PPT" or "讲诚信". In that case, expand it using the textbook context and build a complete teaching outline around the matched unit and sections.
+
+Please automatically infer the following from the user requirements and textbook context:
 
 - Course topic and core content
 - Target audience and difficulty level
@@ -47,7 +53,9 @@ Please automatically infer the following from user requirements:
 - Teaching style (formal/casual/interactive/academic)
 - Visual style (minimal/colorful/professional/playful)
 
-Then output a JSON object with `languageDirective` and `outlines`. Each scene in the `outlines` array must include:
+Then output a JSON object with `languageDirective` and `outlines`. The outline is the first stage only: it should decide the lesson structure page by page. Later generation will use each outline item to create the detailed slide content.
+
+Each scene in the `outlines` array must include:
 
 ```json
 {
@@ -59,6 +67,7 @@ Then output a JSON object with `languageDirective` and `outlines`. Each scene in
       "title": "Scene Title",
       "description": "Teaching purpose description",
       "keyPoints": ["Point 1", "Point 2", "Point 3"],
+      "sourceChunkIds": ["tb_0001", "tb_0002"],
       "order": 1
     }
   ]
@@ -67,6 +76,10 @@ Then output a JSON object with `languageDirective` and `outlines`. Each scene in
 
 ### Special Notes
 
+0. **Textbook grounding**: This is a textbook-specific course generator. Use the built-in textbook context as the primary and authoritative source. Do not introduce concepts, cases, definitions, or examples that are not supported by the textbook context. If PDF or web search content is present, it may only supplement the textbook and must not override it.
+0.1. **For simple requirements**: If the user only names a broad topic, generate a balanced outline from the matched textbook unit: concept introduction, value/meaning, common problems, practical methods, classroom activity or reflection, and a short assessment.
+0.2. **For detailed requirements**: Preserve the user's requested angle, but only use textbook-supported material.
+0.3. **Source traceability**: Add `sourceChunkIds` whenever the textbook context includes chunk IDs like `[tb_0001]`. Use only chunk IDs that are relevant to that scene.
 1. **quiz scenes must include quizConfig**:
    ```json
    "quizConfig": {

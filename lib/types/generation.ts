@@ -65,6 +65,7 @@ export interface SceneOutline {
   title: string;
   description: string; // 1-2 sentences describing the purpose
   keyPoints: string[]; // 3-5 core key points
+  sourceChunkIds?: string[]; // Textbook chunk IDs used as evidence for this outline
   teachingObjective?: string;
   estimatedDuration?: number; // seconds
   order: number;
